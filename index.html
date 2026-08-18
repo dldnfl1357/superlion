@@ -10,24 +10,20 @@
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     width: 100%; height: 100%; overflow: hidden;
-    background: #1a1208; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0e0a06; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     user-select: none; -webkit-user-select: none; touch-action: none;
   }
   #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
   canvas { display: block; width: 100%; height: 100%; touch-action: none; }
-
-  /* 세로모드일 때 회전 안내 */
   #rotate {
     position: fixed; inset: 0; z-index: 50; display: none;
     flex-direction: column; align-items: center; justify-content: center;
-    background: #1a1208; color: #f5d089; text-align: center; padding: 24px; gap: 18px;
+    background: #0e0a06; color: #f5d089; text-align: center; padding: 24px; gap: 18px;
   }
   #rotate .ico { font-size: 64px; animation: spin 2s ease-in-out infinite; }
   #rotate p { font-size: 18px; line-height: 1.5; opacity: .9; }
   @keyframes spin { 0%,100%{ transform: rotate(0) } 50%{ transform: rotate(90deg) } }
-  @media (orientation: portrait) and (max-width: 900px) {
-    #rotate { display: flex; }
-  }
+  @media (orientation: portrait) and (max-width: 900px) { #rotate { display: flex; } }
 </style>
 </head>
 <body>
@@ -44,621 +40,780 @@
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
-// ---- 논리 해상도 (가로모드 기준) ----
+// ===== 논리 해상도 (가로모드) =====
 const W = 900, H = 440;
 let scale = 1, offX = 0, offY = 0;
-
 function resize() {
-  const vw = window.innerWidth, vh = window.innerHeight;
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = vw * dpr;
-  canvas.height = vh * dpr;
-  canvas.style.width = vw + "px";
-  canvas.style.height = vh + "px";
-  // 논리 좌표계를 화면에 꽉 차게 (contain)
+  const vw = innerWidth, vh = innerHeight, dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = vw * dpr; canvas.height = vh * dpr;
+  canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
   scale = Math.min(vw / W, vh / H);
-  offX = (vw - W * scale) / 2;
-  offY = (vh - H * scale) / 2;
+  offX = (vw - W * scale) / 2; offY = (vh - H * scale) / 2;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-window.addEventListener("resize", resize);
-resize();
+addEventListener("resize", resize); resize();
 
-// ---------- 게임 상태 ----------
-const GROUND_Y = 360;          // 땅 표면 y
+// ===== 물리/상수 =====
+const PX = 160;                 // 심바의 화면상 고정 x
+const GROUND_BASE = 350;        // 기본 지면 y
+const MIN_Y = 210, MAX_Y = 384; // 지면 표면 y 허용 범위 (작을수록 높음)
 const GRAVITY = 0.9;
-const JUMP_V = -15.5;
+const JUMP_V = -15.2;
 const BASE_SPEED = 6;
+// 클리어 가능 한계: 단일 점프 체공(≈2·|JUMP_V|/G) 동안 최저속도로 나아가는 거리 안에서만 낭떠러지를 생성
+const AIRTIME = 2 * Math.abs(JUMP_V) / GRAVITY;      // ≈ 33.8 프레임
+const GAP_MIN = 84;
+const GAP_MAX = Math.floor(BASE_SPEED * AIRTIME * 0.66); // ≈ 133px (단일 점프로 여유 있게 통과)
+const LAND_MIN = 168;           // 위험 직후 안전 착지 지면 최소 폭
+const SWIM_STROKE = -6.2;       // 수영 시 탭 한 번의 상승력
+const WATER_G = 0.34;           // 물속 중력
+const WATER_DRAG = 0.9;
+const SIMBA_H = 46;
 
 const State = { READY: 0, PLAY: 1, DEAD: 2 };
 let state = State.READY;
 
-let speed = BASE_SPEED;
-let distance = 0;
-let score = 0;
-let best = +(localStorage.getItem("simbaBest") || 0);
-let shakeT = 0;
+// ===== 스테이지 / 바이옴 =====
+const STAGES = [
+  { name: "주간 초원",   sub: "SAVANNA · DAY",    biome: "day",      len: 3200 },
+  { name: "야간 초원",   sub: "SAVANNA · NIGHT",  biome: "night",    len: 3300 },
+  { name: "동굴",        sub: "CAVERNS",          biome: "cave",     len: 3200 },
+  { name: "킬리만자로",  sub: "KILIMANJARO",      biome: "mountain", len: 3400 },
+  { name: "사막",        sub: "DESERT",           biome: "desert",   len: 3600 },
+];
+let stageIdx = 0, stageStartX = 0, loop = 0, bannerT = 0;
 
-// 심바 (주인공)
-const simba = {
-  x: 150, y: GROUND_Y, w: 62, h: 46,
-  vy: 0, onGround: true, jumps: 0, run: 0
-};
-
-// 엔티티 배열
-let enemies = [];   // 하이에나, 성체 검은사자
-let coins = [];     // 반짝이는 열매(코인 역할)
-let clouds = [];
-let trees = [];     // 배경 아카시아 나무
-let grasses = [];   // 앞쪽 풀 장식
-let particles = [];
-
-let spawnTimer = 0;
-let coinTimer = 0;
-let t = 0;
-
-// ---------- 초기 배경 요소 ----------
-function initBg() {
-  clouds = [];
-  for (let i = 0; i < 5; i++) {
-    clouds.push({ x: Math.random() * W, y: 40 + Math.random() * 120, s: 0.6 + Math.random() * 0.8, sp: 0.2 + Math.random() * 0.3 });
-  }
-  trees = [];
-  for (let i = 0; i < 4; i++) {
-    trees.push({ x: Math.random() * W, sc: 0.7 + Math.random() * 0.6 });
-  }
-  grasses = [];
-  for (let i = 0; i < 14; i++) {
-    grasses.push({ x: Math.random() * W, h: 10 + Math.random() * 16 });
+// 바이옴별 지형/적 파라미터 + 팔레트
+function biomeCfg(b) {
+  switch (b) {
+    case "day":      return { gap:.15, water:.12, elev:55, enemy:.48, mix:["hyena","hyena","lion"], sky:["#8fd0ef","#c7ecfb"], grd:["#c9a24a","#8bbf3e"], far:"#a7cf7e", far2:"#8bbd63", accent:"#6bbf4a" };
+    case "night":    return { gap:.17, water:.12, elev:62, enemy:.60, mix:["hyena","cheetah","lion","cheetah"], sky:["#0f1c38","#26406b"], grd:["#3b4a2e","#2f5a34"], far:"#20304f", far2:"#182640", accent:"#39623b" };
+    case "cave":     return { gap:.30, water:.07, elev:46, enemy:.52, mix:["hyena","snake","lion","snake"], sky:["#171012","#0c0809"], grd:["#4a3b32","#3a2c24"], far:"#241a1c", far2:"#1a1214", accent:"#5a4638" };
+    case "mountain": return { gap:.13, water:.05, elev:95, enemy:.44, mix:["lion","hyena","lion"], sky:["#a9d3ee","#eaf5fc"], grd:["#9aa4ac","#e9eef2"], far:"#cfd8de", far2:"#aeb9c1", accent:"#ffffff" };
+    case "desert":   return { gap:.09, water:.10, elev:52, enemy:.50, mix:["scorpion","cactus","hyena","scorpion"], sky:["#f6c983","#fbe7b4"], grd:["#e6c07a","#d9a94f"], far:"#e9c584", far2:"#dcae63", accent:"#c98d3a" };
   }
 }
-initBg();
+function curStage() { return STAGES[stageIdx]; }
+function cfg() { return biomeCfg(curStage().biome); }
 
-// ---------- 입력: 터치 한 번 = 점프 (최대 2단) ----------
+// ===== 심바 =====
+const simba = { y: GROUND_BASE, vy: 0, onGround: true, jumps: 0, run: 0, mode: "land" };
+
+// ===== 월드 =====
+let camX = 0;                 // 카메라 왼쪽 월드 x
+let genX = 0;                 // 지형 생성 완료 지점
+let lastY = GROUND_BASE;      // 다음 세그먼트 시작 지면 y
+let lastFeat = "ground";      // 직전 세그먼트 종류 (연속 위험 방지)
+let safeX = Infinity;         // 이 월드 x 이전은 평지(안전)
+let segs = [];                // 지형 세그먼트
+let enemies = [], coins = [], particles = [];
+let clouds = [], decors = [], stars = [];
+let speed = BASE_SPEED, score = 0, coinScore = 0;
+let best = +(localStorage.getItem("simbaBest2") || 0);
+let shakeT = 0, deadAt = -999, t = 0;
+let paused = false, timeScale = 1;
+
+const playerWX = () => camX + PX;
+
+// ===== 상단 컨트롤 버튼 =====
+const BX0 = W / 2 - 90, BY = 12, BW = 40, BH = 34;
+const buttons = [
+  { id: "pause", x: BX0,       y: BY, w: BW, h: BH },
+  { id: "s1",    x: BX0 + 48,  y: BY, w: BW, h: BH, sp: 1 },
+  { id: "s2",    x: BX0 + 92,  y: BY, w: BW, h: BH, sp: 2 },
+  { id: "s3",    x: BX0 + 136, y: BY, w: BW, h: BH, sp: 3 },
+];
+function hitButton(lx, ly) {
+  for (const b of buttons) if (lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h) return b;
+  return null;
+}
+function pressButton(b) {
+  if (b.id === "pause") paused = !paused;
+  else { timeScale = b.sp; paused = false; }
+}
+
+// ===== 지형 생성 =====
+function pushGround(x, w, y0, y1) { segs.push({ type: "ground", x, w, y0, y1 }); }
+function groundRamp(w, allowEnemy) {
+  const c = cfg();
+  let delta = (Math.random() - 0.5) * 2 * c.elev;
+  if (curStage().biome === "mountain" && Math.random() < .6) delta = -Math.abs(delta); // 등반 느낌
+  const y1 = Math.max(MIN_Y, Math.min(MAX_Y, lastY + delta));
+  pushGround(genX, w, lastY, y1);
+  // 적 배치: 세그먼트 가운데에만(양끝은 착지/도약 여유) — 단일 점프로 넘을 수 있게 하나만
+  if (allowEnemy && w > 160 && Math.random() < c.enemy) {
+    const kind = c.mix[(Math.random() * c.mix.length) | 0];
+    const ex = genX + w * (0.42 + Math.random() * 0.22);
+    const ey = lastY + (y1 - lastY) * ((ex - genX) / w);
+    const size = kind === "lion" ? { w: 78, h: 58 } : kind === "cactus" ? { w: 34, h: 56 }
+      : kind === "cheetah" ? { w: 68, h: 44 } : kind === "snake" ? { w: 48, h: 40 }
+      : kind === "scorpion" ? { w: 52, h: 30 } : { w: 58, h: 38 };
+    const vx = kind === "hyena" ? 0.6 : kind === "cheetah" ? 1.5 : kind === "scorpion" ? 0.4 : 0;
+    enemies.push({ kind, wx: ex, baseY: ey, y: ey, w: size.w, h: size.h, run: Math.random() * 6, vx });
+  }
+  if (Math.random() < 0.42) {
+    const cx = genX + w * (0.3 + Math.random() * 0.4);
+    const cy = lastY + (y1 - lastY) * ((cx - genX) / w) - 34;
+    coins.push({ wx: cx, y: cy, r: 11, spin: Math.random() * 6, got: false });
+  }
+  lastY = y1; genX += w; lastFeat = "ground";
+}
+function addSegment() {
+  const c = cfg();
+  // 안전 구간: 평지
+  if (genX < safeX) { pushGround(genX, 220, lastY, lastY); genX += 220; lastFeat = "ground"; return; }
+
+  // 위험(낭떠러지/물) 직후에는 반드시 넉넉한 '평평한' 착지 지면 — 적/장애물 없음
+  if (lastFeat === "gap" || lastFeat === "water") {
+    const w = LAND_MIN + Math.random() * 90;
+    pushGround(genX, w, lastY, lastY);   // 수평 착지 → 낭떠러지 양끝 높이 동일
+    if (Math.random() < 0.4) coins.push({ wx: genX + w / 2, y: lastY - 34, r: 11, spin: Math.random() * 6, got: false });
+    genX += w; lastFeat = "ground"; return;
+  }
+
+  const r = Math.random();
+  if (r < c.gap) {
+    // 낭떠러지 (단일 점프로 통과 가능한 폭으로 제한, 양끝 높이는 동일)
+    const w = GAP_MIN + Math.random() * (GAP_MAX - GAP_MIN);
+    segs.push({ type: "gap", x: genX, w });
+    const cx = genX + w / 2, topY = lastY - 66 - Math.random() * 24;
+    for (let i = -1; i <= 1; i++) coins.push({ wx: cx + i * 32, y: topY - Math.abs(i) * 8, r: 11, spin: Math.random() * 6, got: false });
+    genX += w; lastFeat = "gap";
+  } else if (r < c.gap + c.water) {
+    // 물웅덩이 (수영). 폭 제한 + 악어는 가장자리에서 떨어뜨려 진입/탈출 여지 확보
+    const w = 160 + Math.random() * 130;
+    const surfaceY = Math.min(MAX_Y, lastY + 26);
+    segs.push({ type: "water", x: genX, w, surfaceY });
+    const n = w > 230 ? 2 : 1;
+    for (let i = 0; i < n; i++)
+      enemies.push({ kind: "croc", wx: genX + 55 + Math.random() * (w - 110), baseY: surfaceY, y: surfaceY, w: 74, h: 26, run: Math.random() * 6, vx: 0 });
+    for (let i = 0; i < 2; i++) coins.push({ wx: genX + w * (0.3 + i * 0.4), y: surfaceY - 46, r: 11, spin: Math.random() * 6, got: false });
+    genX += w; lastFeat = "water";
+  } else {
+    groundRamp(170 + Math.random() * 170, true);
+  }
+}
+function generate() { while (genX < camX + W + 500) addSegment(); }
+function cull() {
+  const minX = camX - 120;
+  segs = segs.filter(s => s.x + s.w > minX);
+  enemies = enemies.filter(e => e.wx > minX && !e.dead);
+  coins = coins.filter(c => c.wx > minX && !c.got);
+}
+
+// 특정 월드 x의 지면 정보
+function groundAt(wx) {
+  for (const s of segs) {
+    if (wx >= s.x && wx < s.x + s.w) {
+      if (s.type === "ground") { const k = (wx - s.x) / s.w; return { type: "ground", y: s.y0 + (s.y1 - s.y0) * k }; }
+      if (s.type === "water")  return { type: "water", y: s.surfaceY, bottom: s.surfaceY + 132 };
+      return { type: "gap" };
+    }
+  }
+  return { type: "ground", y: lastY };
+}
+const inWater = () => groundAt(playerWX()).type === "water";
+
+// ===== 배경 요소 초기화 =====
+function initDecor() {
+  clouds = []; for (let i = 0; i < 5; i++) clouds.push({ x: Math.random() * W, y: 30 + Math.random() * 120, s: .6 + Math.random() * .8, sp: .2 + Math.random() * .3 });
+  decors = []; for (let i = 0; i < 6; i++) decors.push({ x: Math.random() * W, sc: .7 + Math.random() * .6, seed: Math.random() });
+  stars = []; for (let i = 0; i < 60; i++) stars.push({ x: Math.random() * W, y: Math.random() * 240, r: Math.random() * 1.4 + .3, tw: Math.random() * 6 });
+}
+initDecor();
+
+// ===== 입력: 탭 = 점프(2단) / 수영(스트로크) =====
 function doJump() {
   if (state === State.READY) { startGame(); return; }
-  if (state === State.DEAD) {
-    // 죽은 뒤 살짝 기다렸다 재시작 허용
-    if (t - deadAt > 30) resetGame();
-    return;
-  }
-  if (simba.jumps < 2) {
-    simba.vy = JUMP_V;
-    simba.onGround = false;
-    simba.jumps++;
-    // 점프 먼지
-    for (let i = 0; i < 6; i++) {
-      particles.push({ x: simba.x, y: simba.y, vx: -1 - Math.random() * 2, vy: 1 - Math.random() * 2, life: 20, c: "#d9b06a" });
-    }
+  if (state === State.DEAD) { if (t - deadAt > 30) resetGame(); return; }
+  if (inWater()) {
+    simba.vy = SWIM_STROKE; simba.mode = "swim";
+    for (let i = 0; i < 5; i++) particles.push({ x: PX, y: simba.y, vx: (Math.random() - .5) * 3, vy: -Math.random() * 3, life: 18, c: "#bfe3ff" });
+  } else if (simba.jumps < 2) {
+    simba.vy = JUMP_V; simba.onGround = false; simba.jumps++;
+    for (let i = 0; i < 6; i++) particles.push({ x: PX, y: simba.y, vx: -1 - Math.random() * 2, vy: 1 - Math.random() * 2, life: 20, c: "#d9b06a" });
   }
 }
-
-canvas.addEventListener("pointerdown", (e) => { e.preventDefault(); doJump(); }, { passive: false });
-window.addEventListener("keydown", (e) => {
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const lx = (e.clientX - r.left - offX) / scale, ly = (e.clientY - r.top - offY) / scale;
+  const b = hitButton(lx, ly);
+  if (b) { pressButton(b); return; }
+  doJump();
+}, { passive: false });
+addEventListener("keydown", e => {
   if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); doJump(); }
+  else if (e.key === "p" || e.key === "P") paused = !paused;
+  else if (e.key === "1") { timeScale = 1; paused = false; }
+  else if (e.key === "2") { timeScale = 2; paused = false; }
+  else if (e.key === "3") { timeScale = 3; paused = false; }
 });
 
-// ---------- 게임 흐름 ----------
-let deadAt = -999;
-function startGame() {
-  state = State.PLAY;
-}
+// ===== 게임 흐름 =====
+function startGame() { state = State.PLAY; safeX = camX + 520; bannerT = 150; generate(); }
 function resetGame() {
   state = State.PLAY;
-  speed = BASE_SPEED;
-  distance = 0; score = 0;
-  enemies = []; coins = []; particles = [];
-  spawnTimer = 60; coinTimer = 90;
-  simba.y = GROUND_Y; simba.vy = 0; simba.onGround = true; simba.jumps = 0;
-  initBg();
+  speed = BASE_SPEED; score = 0; coinScore = 0;
+  camX = 0; genX = 0; lastY = GROUND_BASE; lastFeat = "ground"; safeX = 520;
+  segs = []; enemies = []; coins = []; particles = [];
+  stageIdx = 0; stageStartX = 0; loop = 0; bannerT = 150;
+  simba.y = GROUND_BASE; simba.vy = 0; simba.onGround = true; simba.jumps = 0; simba.mode = "land";
+  initDecor(); generate();
 }
 function gameOver() {
-  state = State.DEAD;
-  deadAt = t;
-  shakeT = 18;
-  if (score > best) { best = score; localStorage.setItem("simbaBest", best); }
-  for (let i = 0; i < 18; i++) {
-    particles.push({ x: simba.x, y: simba.y - 20, vx: (Math.random() - 0.5) * 8, vy: -Math.random() * 8, life: 40, c: "#c96a2a" });
+  if (state !== State.PLAY) return;
+  state = State.DEAD; deadAt = t; shakeT = 18;
+  const tot = score + coinScore;
+  if (tot > best) { best = tot; localStorage.setItem("simbaBest2", best); }
+  for (let i = 0; i < 20; i++) particles.push({ x: PX, y: simba.y - 20, vx: (Math.random() - .5) * 8, vy: -Math.random() * 8, life: 42, c: "#c96a2a" });
+}
+function stageCheck() {
+  if (camX - stageStartX > curStage().len) {
+    stageIdx++;
+    if (stageIdx >= STAGES.length) { stageIdx = 0; loop++; }
+    stageStartX = camX; bannerT = 150;
+    safeX = genX + 260; // 스테이지 전환 직후 짧은 평지
   }
 }
 
-// ---------- 스폰 ----------
-function spawnEnemy() {
-  // 종류: hyena (작고 낮음), lion (크고 위협적, 성체 검은 갈기)
-  const kind = Math.random() < 0.68 ? "hyena" : "lion";
-  if (kind === "hyena") {
-    enemies.push({ kind, x: W + 40, y: GROUND_Y, w: 58, h: 38, run: 0 });
-  } else {
-    enemies.push({ kind, x: W + 60, y: GROUND_Y, w: 78, h: 58, run: 0 });
-  }
-}
-function spawnCoin() {
-  // 공중 또는 지상 근처 열매
-  const high = Math.random() < 0.5;
-  const y = high ? GROUND_Y - 90 - Math.random() * 70 : GROUND_Y - 30;
-  const n = 1 + (Math.random() * 3 | 0);
-  for (let i = 0; i < n; i++) {
-    coins.push({ x: W + 30 + i * 34, y, r: 11, spin: Math.random() * 6, got: false });
-  }
-}
-
-// ---------- 업데이트 ----------
+// ===== 업데이트 =====
 function update() {
-  t++;
-  if (shakeT > 0) shakeT--;
+  t++; if (bannerT > 0) bannerT--; if (shakeT > 0) shakeT--;
+  simba.run += state === State.PLAY ? .35 : .2;
 
-  // 배경은 항상 흐른다 (READY 화면도 살짝 움직이게)
-  const bgSp = state === State.PLAY ? speed : 1.4;
-  for (const c of clouds) { c.x -= c.sp * (bgSp * 0.25); if (c.x < -80) { c.x = W + 60; c.y = 40 + Math.random() * 120; } }
-  for (const tr of trees) { tr.x -= bgSp * 0.4; if (tr.x < -90) { tr.x = W + 80 + Math.random() * 120; tr.sc = 0.7 + Math.random() * 0.6; } }
-  for (const g of grasses) { g.x -= bgSp; if (g.x < -20) { g.x = W + Math.random() * 60; g.h = 10 + Math.random() * 16; } }
-
-  // 심바 달리기 애니메이션
-  simba.run += state === State.PLAY ? 0.35 : 0.2;
-
-  if (state !== State.PLAY) {
-    // 파티클만 갱신
-    updateParticles();
-    return;
+  const advancing = state !== State.DEAD;
+  if (advancing) {
+    const sp = state === State.PLAY ? speed : BASE_SPEED * 0.6;
+    camX += inWater() ? sp * 0.82 : sp;
+    generate(); cull();
+    for (const c of clouds) { c.x -= c.sp * sp * .25; if (c.x < -90) { c.x = W + 60; c.y = 30 + Math.random() * 120; } }
+    for (const d of decors) { d.x -= sp * .4; if (d.x < -110) { d.x = W + 80 + Math.random() * 140; d.sc = .7 + Math.random() * .6; d.seed = Math.random(); } }
+    for (const s of stars) { s.x -= sp * .08; if (s.x < 0) s.x += W; }
   }
 
-  // 난이도 상승
-  speed += 0.0018;
-  distance += speed;
-  score = Math.floor(distance / 12);
+  if (state === State.READY) { simba.y = groundAt(playerWX()).y; updateParticles(); return; }
+  if (state === State.DEAD) { updateParticles(); return; }
 
-  // 중력/점프
-  simba.vy += GRAVITY;
-  simba.y += simba.vy;
-  if (simba.y >= GROUND_Y) {
-    simba.y = GROUND_Y; simba.vy = 0;
-    if (!simba.onGround) {
-      // 착지 먼지
-      for (let i = 0; i < 5; i++) particles.push({ x: simba.x, y: GROUND_Y, vx: -1 - Math.random() * 2, vy: -Math.random() * 2, life: 16, c: "#d9b06a" });
+  // PLAY
+  speed += 0.0016 * (1 + loop * 0.25);
+  score = Math.floor(camX / 10);
+
+  // 물리
+  const gi = groundAt(playerWX());
+  if (gi.type === "water") {
+    simba.mode = "swim";
+    simba.vy += WATER_G; simba.vy *= WATER_DRAG; simba.y += simba.vy;
+    simba.onGround = false; simba.jumps = 0;
+    if (simba.y < gi.y - 30) simba.y = gi.y - 30;      // 수면 위로 너무 못 튀게
+    if (simba.y > gi.bottom) { gameOver(); }             // 바닥까지 가라앉으면 익사
+  } else {
+    simba.mode = "land";
+    simba.vy += GRAVITY; simba.y += simba.vy;
+    if (gi.type === "ground") {
+      if (simba.y >= gi.y) {
+        if (!simba.onGround && simba.vy > 4)
+          for (let i = 0; i < 5; i++) particles.push({ x: PX, y: gi.y, vx: -1 - Math.random() * 2, vy: -Math.random() * 2, life: 16, c: "#d9b06a" });
+        simba.y = gi.y; simba.vy = 0; simba.onGround = true; simba.jumps = 0;
+      } else simba.onGround = false;
+    } else { // gap
+      simba.onGround = false;
+      if (simba.y > H + 90) gameOver();
     }
-    simba.onGround = true; simba.jumps = 0;
   }
 
-  // 스폰 타이밍 (속도 오를수록 촘촘)
-  spawnTimer--;
-  if (spawnTimer <= 0) {
-    spawnEnemy();
-    const gap = Math.max(46, 96 - (speed - BASE_SPEED) * 5);
-    spawnTimer = gap + Math.random() * gap;
-  }
-  coinTimer--;
-  if (coinTimer <= 0) { spawnCoin(); coinTimer = 120 + Math.random() * 120; }
-
-  // 적 이동
-  for (const e of enemies) { e.x -= speed; e.run += 0.3; }
-  enemies = enemies.filter(e => e.x > -120);
-
-  // 코인 이동
-  for (const c of coins) { c.x -= speed; c.spin += 0.2; }
-  coins = coins.filter(c => c.x > -40 && !c.got);
-
-  // 충돌 판정 (히트박스는 살짝 관대하게)
-  const sb = { x: simba.x - 24, y: simba.y - simba.h, w: 48, h: simba.h - 4 };
+  // 적/열매 이동
   for (const e of enemies) {
-    const eb = { x: e.x - e.w / 2 + 8, y: e.y - e.h + 6, w: e.w - 16, h: e.h - 8 };
+    e.run += .3;
+    if (e.vx) e.wx -= e.vx;
+    if (e.kind === "croc") e.y = e.baseY + Math.sin(e.run * .4) * 4;
+  }
+  for (const c of coins) c.spin += .2;
+
+  // 충돌
+  const sb = { x: playerWX() - 22, y: simba.y - SIMBA_H, w: 44, h: SIMBA_H - 6 };
+  for (const e of enemies) {
+    let eb;
+    if (e.kind === "cactus") eb = { x: e.wx - 10, y: e.baseY - e.h, w: 20, h: e.h };
+    else if (e.kind === "croc") eb = { x: e.wx - e.w / 2 + 6, y: e.y - 12, w: e.w - 12, h: 22 };
+    else if (e.kind === "snake" || e.kind === "scorpion") eb = { x: e.wx - e.w / 2 + 6, y: e.baseY - e.h + 6, w: e.w - 12, h: e.h - 8 };
+    else eb = { x: e.wx - e.w / 2 + 8, y: e.baseY - e.h + 6, w: e.w - 16, h: e.h - 8 };
     if (aabb(sb, eb)) { gameOver(); break; }
   }
-  for (const c of coins) {
-    if (!c.got) {
-      const dx = (simba.x) - c.x, dy = (simba.y - 22) - c.y;
-      if (dx * dx + dy * dy < (c.r + 26) * (c.r + 26)) {
-        c.got = true; score += 5;
-        for (let i = 0; i < 8; i++) particles.push({ x: c.x, y: c.y, vx: (Math.random() - 0.5) * 4, vy: -Math.random() * 4, life: 24, c: "#ffd85e" });
-      }
+  for (const c of coins) if (!c.got) {
+    const dx = playerWX() - c.wx, dy = (simba.y - 22) - c.y;
+    if (dx * dx + dy * dy < (c.r + 26) ** 2) {
+      c.got = true; coinScore += 5;
+      for (let i = 0; i < 8; i++) particles.push({ x: c.wx - camX, y: c.y, vx: (Math.random() - .5) * 4, vy: -Math.random() * 4, life: 24, c: "#ffd85e" });
     }
   }
 
+  stageCheck();
   updateParticles();
 }
-
-function updateParticles() {
-  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += 0.25; p.life--; }
-  particles = particles.filter(p => p.life > 0);
-}
-
-function aabb(a, b) {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
+function updateParticles() { for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += .25; p.life--; } particles = particles.filter(p => p.life > 0); }
+function aabb(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
 
 // ================= 그리기 =================
 function draw() {
-  ctx.save();
-  ctx.translate(offX, offY);
-  ctx.scale(scale, scale);
+  ctx.save(); ctx.translate(offX, offY); ctx.scale(scale, scale);
+  if (shakeT > 0) { const s = shakeT / 18; ctx.translate((Math.random() - .5) * 10 * s, (Math.random() - .5) * 10 * s); }
 
-  // 화면 흔들림
-  if (shakeT > 0) {
-    const s = shakeT / 18;
-    ctx.translate((Math.random() - 0.5) * 10 * s, (Math.random() - 0.5) * 10 * s);
-  }
-
-  drawSky();
-  drawSun();
-  for (const c of clouds) drawCloud(c);
-  drawMountains();
-  for (const tr of trees) drawTree(tr);
-  drawGround();
-  for (const g of grasses) drawGrass(g);
-
-  for (const c of coins) drawCoin(c);
-  for (const e of enemies) e.kind === "hyena" ? drawHyena(e) : drawLion(e);
+  const c = cfg(), biome = curStage().biome;
+  drawSky(c, biome);
+  drawCelestial(biome);
+  drawFar(c, biome);
+  drawDecor(c, biome);
+  drawTerrain(c, biome);
+  for (const co of coins) drawCoin(co);
+  for (const e of enemies) drawEnemy(e);
   drawSimba();
-
-  for (const p of particles) { ctx.globalAlpha = Math.max(0, p.life / 30); ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 4, 4); }
+  for (const p of particles) { ctx.globalAlpha = Math.max(0, p.life / 32); ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 4, 4); }
   ctx.globalAlpha = 1;
+  if (biome === "cave") drawCaveCeiling();
 
   drawHUD();
-
+  if (bannerT > 0) drawBanner();
   if (state === State.READY) drawReady();
   if (state === State.DEAD) drawDead();
-
+  if (paused) drawPausedOverlay();
+  drawControls();
   ctx.restore();
 }
 
-// ---- 배경 ----
-function drawSky() {
+function drawControls() {
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const b of buttons) {
+    const active = b.id === "pause" ? paused : (timeScale === b.sp && !paused);
+    ctx.fillStyle = active ? "rgba(240,170,60,.92)" : "rgba(0,0,0,.4)";
+    rr(b.x, b.y, b.w, b.h, 9); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.25)"; ctx.lineWidth = 1; rr(b.x, b.y, b.w, b.h, 9); ctx.stroke();
+    ctx.fillStyle = active ? "#3a2408" : "#fff4dc";
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2 + 1;
+    if (b.id === "pause") {
+      if (paused) { // ▶ 재생
+        ctx.beginPath(); ctx.moveTo(cx - 6, cy - 8); ctx.lineTo(cx - 6, cy + 8); ctx.lineTo(cx + 8, cy); ctx.closePath(); ctx.fill();
+      } else { // ⏸ 일시정지
+        ctx.fillRect(cx - 7, cy - 8, 5, 16); ctx.fillRect(cx + 2, cy - 8, 5, 16);
+      }
+    } else {
+      ctx.font = "bold 16px -apple-system, sans-serif";
+      ctx.fillText(b.sp + "×", cx, cy);
+    }
+  }
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+}
+function drawPausedOverlay() {
+  dim(.4); ctx.textAlign = "center";
+  ctx.fillStyle = "#fff4dc"; ctx.font = "bold 40px -apple-system, sans-serif"; ctx.fillText("일시정지", W / 2, H / 2);
+  ctx.fillStyle = "#ffd9a0"; ctx.font = "16px -apple-system, sans-serif"; ctx.fillText("▶ 버튼을 눌러 계속", W / 2, H / 2 + 34);
+  ctx.textAlign = "left";
+}
+
+// ---- 하늘 ----
+function drawSky(c, biome) {
   const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, "#f6b24a");
-  g.addColorStop(0.45, "#f2894a");
-  g.addColorStop(0.8, "#e86a3f");
-  g.addColorStop(1, "#d9542f");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, W, H);
+  g.addColorStop(0, c.sky[0]); g.addColorStop(1, c.sky[1]);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (biome === "night") { for (const s of stars) { ctx.globalAlpha = .5 + Math.sin(t * .05 + s.tw) * .4; ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill(); } ctx.globalAlpha = 1; }
 }
-function drawSun() {
-  const cx = 720, cy = 130, r = 78;
-  const g = ctx.createRadialGradient(cx, cy, 10, cx, cy, r);
-  g.addColorStop(0, "#fff2c4");
-  g.addColorStop(0.5, "#ffdf7a");
-  g.addColorStop(1, "rgba(255,210,110,0)");
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#fff0b8";
-  ctx.beginPath(); ctx.arc(cx, cy, 44, 0, Math.PI * 2); ctx.fill();
+function drawCelestial(biome) {
+  if (biome === "day") { sun(720, 110, 46, "#fff0b8", "#ffdf7a"); }
+  else if (biome === "desert") { sun(700, 130, 52, "#fff6d8", "#ffd98a"); }
+  else if (biome === "night") {
+    ctx.fillStyle = "#f2f2e0"; ctx.beginPath(); ctx.arc(730, 100, 40, 0, 7); ctx.fill();
+    ctx.fillStyle = "rgba(20,32,58,1)"; ctx.beginPath(); ctx.arc(748, 90, 34, 0, 7); ctx.fill();
+  } else if (biome === "mountain") { sun(150, 90, 40, "#fff", "#eaf3ff"); }
 }
-function drawCloud(c) {
-  ctx.save();
-  ctx.translate(c.x, c.y); ctx.scale(c.s, c.s);
-  ctx.fillStyle = "rgba(255,240,210,0.55)";
-  for (const [dx, dy, r] of [[0,0,20],[24,4,26],[52,2,20],[26,-12,20]]) {
-    ctx.beginPath(); ctx.arc(dx, dy, r, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.restore();
-}
-function drawMountains() {
-  ctx.fillStyle = "#c25a34";
-  ctx.beginPath();
-  ctx.moveTo(0, 320);
-  ctx.lineTo(120, 210); ctx.lineTo(240, 300); ctx.lineTo(380, 200);
-  ctx.lineTo(520, 300); ctx.lineTo(680, 220); ctx.lineTo(860, 300);
-  ctx.lineTo(W, 260); ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
-  ctx.fill();
-  ctx.fillStyle = "#a94a2b";
-  ctx.beginPath();
-  ctx.moveTo(0, 345);
-  ctx.lineTo(160, 285); ctx.lineTo(320, 340); ctx.lineTo(500, 280);
-  ctx.lineTo(700, 345); ctx.lineTo(W, 300); ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
-  ctx.fill();
-}
-function drawTree(tr) {
-  ctx.save();
-  ctx.translate(tr.x, GROUND_Y + 2); ctx.scale(tr.sc, tr.sc);
-  // 아카시아 나무 (기린나무)
-  ctx.strokeStyle = "#5a3418"; ctx.lineWidth = 7; ctx.lineCap = "round";
-  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -46);
-  ctx.moveTo(0, -46); ctx.lineTo(-28, -66);
-  ctx.moveTo(0, -46); ctx.lineTo(30, -62);
-  ctx.stroke();
-  ctx.fillStyle = "#3f6f2e";
-  ctx.beginPath(); ctx.ellipse(0, -74, 62, 18, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#4c8437";
-  ctx.beginPath(); ctx.ellipse(0, -80, 50, 13, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.restore();
-}
-function drawGround() {
-  const g = ctx.createLinearGradient(0, GROUND_Y, 0, H);
-  g.addColorStop(0, "#d99a4e");
-  g.addColorStop(1, "#b8763a");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
-  // 땅 표면 라인
-  ctx.strokeStyle = "#a5642f"; ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.moveTo(0, GROUND_Y + 4); ctx.lineTo(W, GROUND_Y + 4); ctx.stroke();
-  // 흐르는 질감 점
-  ctx.fillStyle = "rgba(120,70,30,0.25)";
-  const off = (distance * 1) % 60;
-  for (let x = -off; x < W; x += 60) {
-    ctx.fillRect(x, GROUND_Y + 26, 18, 4);
-    ctx.fillRect(x + 30, GROUND_Y + 50, 14, 4);
-  }
-}
-function drawGrass(g) {
-  ctx.strokeStyle = "#6f4a22"; ctx.lineWidth = 3; ctx.lineCap = "round";
-  const x = g.x, y = GROUND_Y + 6;
-  ctx.beginPath();
-  ctx.moveTo(x, y); ctx.lineTo(x - 4, y - g.h);
-  ctx.moveTo(x, y); ctx.lineTo(x, y - g.h - 3);
-  ctx.moveTo(x, y); ctx.lineTo(x + 4, y - g.h);
-  ctx.stroke();
+function sun(x, y, r, core, glow) {
+  const g = ctx.createRadialGradient(x, y, 6, x, y, r + 34);
+  g.addColorStop(0, glow); g.addColorStop(.55, glow); g.addColorStop(1, "rgba(255,220,120,0)");
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r + 34, 0, 7); ctx.fill();
+  ctx.fillStyle = core; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
 }
 
-// ---- 코인(열매) ----
+// ---- 원경 ----
+function drawFar(c, biome) {
+  if (biome === "cave") { // 동굴 벽
+    ctx.fillStyle = c.far; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    for (let i = 0; i < 8; i++) { const x = ((i * 140 - camX * .2) % (W + 200)) - 100; ctx.beginPath(); ctx.arc(x, 120 + (i % 3) * 40, 60, 0, 7); ctx.fill(); }
+    return;
+  }
+  if (biome === "mountain") { // 킬리만자로 설산
+    ctx.fillStyle = c.far2;
+    ctx.beginPath(); ctx.moveTo(0, 330); ctx.lineTo(260, 90); ctx.lineTo(520, 330); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(360, 330); ctx.lineTo(650, 60); ctx.lineTo(W, 330); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#fff"; // 만년설
+    ctx.beginPath(); ctx.moveTo(600, 150); ctx.lineTo(650, 60); ctx.lineTo(704, 150); ctx.quadraticCurveTo(650, 130, 600, 150); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(215, 165); ctx.lineTo(260, 90); ctx.lineTo(308, 165); ctx.quadraticCurveTo(260, 145, 215, 165); ctx.closePath(); ctx.fill();
+    return;
+  }
+  // 초원/사막 언덕
+  const y = 300;
+  ctx.fillStyle = c.far;
+  ctx.beginPath(); ctx.moveTo(0, y);
+  for (let x = 0; x <= W; x += 60) ctx.lineTo(x, y - 34 * Math.sin((x - camX * .15) * .012));
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = c.far2;
+  ctx.beginPath(); ctx.moveTo(0, y + 34);
+  for (let x = 0; x <= W; x += 60) ctx.lineTo(x, y + 20 - 26 * Math.sin((x - camX * .25) * .01 + 2));
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath(); ctx.fill();
+}
+
+// ---- 중경 장식 (지형 뒤) ----
+function drawDecor(c, biome) {
+  for (const d of decors) {
+    ctx.save(); ctx.translate(d.x, 322); ctx.scale(d.sc, d.sc);
+    if (biome === "day" || biome === "night") acacia(biome === "night");
+    else if (biome === "desert") cactusBg();
+    else if (biome === "cave") caveRock();
+    else if (biome === "mountain") pine();
+    ctx.restore();
+  }
+  if (biome === "day" || biome === "mountain") for (const cl of clouds) cloud(cl);
+}
+function acacia(night) {
+  ctx.strokeStyle = night ? "#0e1c14" : "#5a3418"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -46); ctx.moveTo(0, -46); ctx.lineTo(-28, -66); ctx.moveTo(0, -46); ctx.lineTo(30, -62); ctx.stroke();
+  ctx.fillStyle = night ? "#14361f" : "#3f6f2e"; ctx.beginPath(); ctx.ellipse(0, -74, 62, 18, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = night ? "#1a4327" : "#4c8437"; ctx.beginPath(); ctx.ellipse(0, -80, 50, 13, 0, 0, 7); ctx.fill();
+}
+function cactusBg() {
+  ctx.fillStyle = "#3e7d3a";
+  rr(-8, -70, 16, 70, 8); ctx.fill();
+  rr(-26, -46, 12, 30, 6); ctx.fill(); ctx.fillRect(-26, -46, 22, 12);
+  rr(14, -56, 12, 34, 6); ctx.fill(); ctx.fillRect(4, -56, 22, 12);
+}
+function caveRock() { ctx.fillStyle = "#2c211c"; ctx.beginPath(); ctx.moveTo(-40, 0); ctx.lineTo(-14, -44); ctx.lineTo(10, -20); ctx.lineTo(34, -50); ctx.lineTo(48, 0); ctx.closePath(); ctx.fill(); }
+function pine() { ctx.fillStyle = "#e8eef2"; ctx.fillRect(-3, -20, 6, 20); ctx.fillStyle = "#3a5f43"; for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(0, -60 + i * 18); ctx.lineTo(-20 + i * 4, -20 + i * 16); ctx.lineTo(20 - i * 4, -20 + i * 16); ctx.closePath(); ctx.fill(); } }
+function cloud(c) {
+  ctx.save(); ctx.translate(c.x, c.y); ctx.scale(c.s, c.s); ctx.fillStyle = "rgba(255,255,255,0.5)";
+  for (const [dx, dy, r] of [[0,0,20],[24,4,26],[52,2,20],[26,-12,20]]) { ctx.beginPath(); ctx.arc(dx, dy, r, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+function drawCaveCeiling() {
+  ctx.fillStyle = "#1a1214"; ctx.fillRect(0, 0, W, 40);
+  ctx.fillStyle = "#241a1c";
+  for (let i = 0; i < 14; i++) { const x = ((i * 90 - camX * .5) % (W + 120)) - 60; const h = 24 + (i % 4) * 14; ctx.beginPath(); ctx.moveTo(x - 14, 40); ctx.lineTo(x, 40 + h); ctx.lineTo(x + 14, 40); ctx.closePath(); ctx.fill(); }
+}
+
+// ---- 지형 ----
+function drawTerrain(c, biome) {
+  for (const s of segs) {
+    const sx = s.x - camX; if (sx > W || sx + s.w < 0) continue;
+    if (s.type === "ground") {
+      const y0 = s.y0, y1 = s.y1;
+      const body = ctx.createLinearGradient(0, y0, 0, H); body.addColorStop(0, c.grd[0]); body.addColorStop(1, shade(c.grd[0], -20));
+      ctx.fillStyle = body;
+      ctx.beginPath(); ctx.moveTo(sx, y0); ctx.lineTo(sx + s.w, y1); ctx.lineTo(sx + s.w, H); ctx.lineTo(sx, H); ctx.closePath(); ctx.fill();
+      // 표면 스트라이프 (풀/모래/눈/바위)
+      ctx.fillStyle = c.grd[1];
+      ctx.beginPath(); ctx.moveTo(sx, y0); ctx.lineTo(sx + s.w, y1); ctx.lineTo(sx + s.w, y1 + 12); ctx.lineTo(sx, y0 + 12); ctx.closePath(); ctx.fill();
+      if (biome === "day" || biome === "night") { // 풀 포기
+        ctx.strokeStyle = c.accent; ctx.lineWidth = 2;
+        for (let x = 6; x < s.w; x += 22) { const yy = y0 + (y1 - y0) * (x / s.w); ctx.beginPath(); ctx.moveTo(sx + x, yy + 2); ctx.lineTo(sx + x, yy - 7); ctx.stroke(); }
+      }
+    } else if (s.type === "water") {
+      // 물 표면 아래 채우기 + 파도
+      const wy = s.surfaceY;
+      const g = ctx.createLinearGradient(0, wy, 0, H); g.addColorStop(0, "rgba(58,150,216,.85)"); g.addColorStop(1, "rgba(20,80,150,.95)");
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.moveTo(sx, wy);
+      for (let x = 0; x <= s.w; x += 12) ctx.lineTo(sx + x, wy + Math.sin((x + camX) * .06 + t * .12) * 3);
+      ctx.lineTo(sx + s.w, H); ctx.lineTo(sx, H); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,.5)"; ctx.lineWidth = 2;
+      ctx.beginPath(); for (let x = 0; x <= s.w; x += 12) { const yy = wy + Math.sin((x + camX) * .06 + t * .12) * 3; x === 0 ? ctx.moveTo(sx + x, yy) : ctx.lineTo(sx + x, yy); } ctx.stroke();
+    }
+  }
+}
+
+// ---- 열매 ----
 function drawCoin(c) {
-  ctx.save();
-  ctx.translate(c.x, c.y);
-  const sx = Math.abs(Math.cos(c.spin)) * 0.8 + 0.2;
-  ctx.scale(sx, 1);
-  const g = ctx.createRadialGradient(-3, -3, 2, 0, 0, c.r);
-  g.addColorStop(0, "#fff1a8"); g.addColorStop(1, "#f2a52a");
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(0, 0, c.r, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = "#c67d16"; ctx.lineWidth = 2; ctx.stroke();
-  ctx.restore();
-  // 잎사귀
-  ctx.fillStyle = "#4c8437";
-  ctx.beginPath(); ctx.ellipse(c.x + 2, c.y - c.r - 2, 5, 3, -0.6, 0, Math.PI * 2); ctx.fill();
+  const x = c.wx - camX, y = c.y; if (x < -20 || x > W + 20) return;
+  ctx.save(); ctx.translate(x, y); ctx.scale(Math.abs(Math.cos(c.spin)) * .8 + .2, 1);
+  const g = ctx.createRadialGradient(-3, -3, 2, 0, 0, c.r); g.addColorStop(0, "#fff1a8"); g.addColorStop(1, "#f2a52a");
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, c.r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#c67d16"; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+  ctx.fillStyle = "#4c8437"; ctx.beginPath(); ctx.ellipse(x + 2, y - c.r - 2, 5, 3, -.6, 0, 7); ctx.fill();
 }
 
-// ---- 심바 (사자 새끼, 황금색) ----
+// ---- 심바 ----
 function drawSimba() {
+  const swim = simba.mode === "swim";
   const bob = Math.sin(simba.run) * (simba.onGround ? 2.5 : 0);
-  const cx = simba.x, feetY = simba.y;
-  ctx.save();
-  ctx.translate(cx, feetY);
-
+  ctx.save(); ctx.translate(PX, simba.y);
+  if (swim) ctx.rotate(0.12);
   // 그림자
-  ctx.fillStyle = "rgba(80,40,10,0.25)";
-  const shScale = simba.onGround ? 1 : 0.6;
-  ctx.beginPath(); ctx.ellipse(0, 4, 30 * shScale, 7 * shScale, 0, 0, Math.PI * 2); ctx.fill();
-
+  if (!swim) { ctx.fillStyle = "rgba(60,30,8,.25)"; const sc = simba.onGround ? 1 : .6; ctx.beginPath(); ctx.ellipse(0, 4, 30 * sc, 7 * sc, 0, 0, 7); ctx.fill(); }
   const bodyY = -30 + bob;
-  // 다리 (달리는 애니)
-  const legSwing = simba.onGround ? Math.sin(simba.run * 1.6) * 10 : 6;
+  const legSwing = swim ? Math.sin(t * .4) * 8 : (simba.onGround ? Math.sin(simba.run * 1.6) * 10 : 6);
   ctx.strokeStyle = "#d98e2b"; ctx.lineWidth = 8; ctx.lineCap = "round";
   ctx.beginPath();
-  ctx.moveTo(-14, bodyY + 18); ctx.lineTo(-14 - legSwing, 0);
-  ctx.moveTo(14, bodyY + 18); ctx.lineTo(14 + legSwing, 0);
+  ctx.moveTo(-14, bodyY + 18); ctx.lineTo(-14 - legSwing, 0 + (swim ? -6 : 0));
+  ctx.moveTo(14, bodyY + 18); ctx.lineTo(14 + legSwing, 0 + (swim ? -6 : 0));
+  ctx.moveTo(-6, bodyY + 18); ctx.lineTo(-6 + legSwing, 0 + (swim ? -6 : 0));
+  ctx.moveTo(22, bodyY + 18); ctx.lineTo(22 - legSwing, 0 + (swim ? -6 : 0));
   ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(-6, bodyY + 18); ctx.lineTo(-6 + legSwing, 0);
-  ctx.moveTo(22, bodyY + 18); ctx.lineTo(22 - legSwing, 0);
-  ctx.stroke();
-
   // 꼬리
   ctx.strokeStyle = "#e0972f"; ctx.lineWidth = 5;
-  ctx.beginPath();
-  ctx.moveTo(-24, bodyY + 6);
-  ctx.quadraticCurveTo(-44, bodyY - 4 + Math.sin(simba.run) * 4, -40, bodyY - 20);
-  ctx.stroke();
-  ctx.fillStyle = "#8a4a1c";
-  ctx.beginPath(); ctx.arc(-40, bodyY - 22, 5, 0, Math.PI * 2); ctx.fill();
-
+  ctx.beginPath(); ctx.moveTo(-24, bodyY + 6); ctx.quadraticCurveTo(-44, bodyY - 4 + Math.sin(simba.run) * 4, -40, bodyY - 20); ctx.stroke();
+  ctx.fillStyle = "#8a4a1c"; ctx.beginPath(); ctx.arc(-40, bodyY - 22, 5, 0, 7); ctx.fill();
   // 몸통
-  const bg = ctx.createLinearGradient(0, bodyY - 8, 0, bodyY + 22);
-  bg.addColorStop(0, "#f6b64a"); bg.addColorStop(1, "#e2942d");
-  ctx.fillStyle = bg;
-  roundRect(-26, bodyY, 46, 26, 13); ctx.fill();
-
+  const bg = ctx.createLinearGradient(0, bodyY - 8, 0, bodyY + 22); bg.addColorStop(0, "#f6b64a"); bg.addColorStop(1, "#e2942d");
+  ctx.fillStyle = bg; rr(-26, bodyY, 46, 26, 13); ctx.fill();
   // 머리
   const hx = 22, hy = bodyY - 4;
-  ctx.fillStyle = "#f6b84c";
-  ctx.beginPath(); ctx.arc(hx, hy, 18, 0, Math.PI * 2); ctx.fill();
-  // 귀
-  ctx.fillStyle = "#e2942d";
-  ctx.beginPath(); ctx.arc(hx - 10, hy - 15, 6, 0, Math.PI * 2); ctx.fill();
-  ctx.beginPath(); ctx.arc(hx + 10, hy - 15, 6, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#7a3f18";
-  ctx.beginPath(); ctx.arc(hx - 10, hy - 15, 3, 0, Math.PI * 2); ctx.fill();
-  ctx.beginPath(); ctx.arc(hx + 10, hy - 15, 3, 0, Math.PI * 2); ctx.fill();
-  // 새끼사자 갈기 힌트 (머리 위 붉은 털)
-  ctx.fillStyle = "#c9622a";
-  ctx.beginPath(); ctx.moveTo(hx - 4, hy - 16); ctx.quadraticCurveTo(hx + 2, hy - 30, hx + 8, hy - 16); ctx.fill();
-  // 주둥이
-  ctx.fillStyle = "#ffe6b0";
-  ctx.beginPath(); ctx.ellipse(hx + 8, hy + 6, 10, 8, 0, 0, Math.PI * 2); ctx.fill();
-  // 코
-  ctx.fillStyle = "#6e3a18";
-  ctx.beginPath(); ctx.moveTo(hx + 14, hy + 2); ctx.lineTo(hx + 20, hy + 2); ctx.lineTo(hx + 17, hy + 6); ctx.closePath(); ctx.fill();
-  // 눈
-  ctx.fillStyle = "#2a1607";
-  ctx.beginPath(); ctx.arc(hx + 6, hy - 2, 2.4, 0, Math.PI * 2); ctx.fill();
-
+  ctx.fillStyle = "#f6b84c"; ctx.beginPath(); ctx.arc(hx, hy, 18, 0, 7); ctx.fill();
+  ctx.fillStyle = "#e2942d"; ctx.beginPath(); ctx.arc(hx - 10, hy - 15, 6, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(hx + 10, hy - 15, 6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#7a3f18"; ctx.beginPath(); ctx.arc(hx - 10, hy - 15, 3, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(hx + 10, hy - 15, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = "#c9622a"; ctx.beginPath(); ctx.moveTo(hx - 4, hy - 16); ctx.quadraticCurveTo(hx + 2, hy - 30, hx + 8, hy - 16); ctx.fill();
+  ctx.fillStyle = "#ffe6b0"; ctx.beginPath(); ctx.ellipse(hx + 8, hy + 6, 10, 8, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#6e3a18"; ctx.beginPath(); ctx.moveTo(hx + 14, hy + 2); ctx.lineTo(hx + 20, hy + 2); ctx.lineTo(hx + 17, hy + 6); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#2a1607"; ctx.beginPath(); ctx.arc(hx + 6, hy - 2, 2.4, 0, 7); ctx.fill();
   ctx.restore();
 }
 
-// ---- 하이에나 (적) ----
-function drawHyena(e) {
-  const cx = e.x, feetY = e.y;
-  ctx.save();
-  ctx.translate(cx, feetY);
-  // 그림자
-  ctx.fillStyle = "rgba(80,40,10,0.25)";
-  ctx.beginPath(); ctx.ellipse(0, 4, 28, 6, 0, 0, Math.PI * 2); ctx.fill();
-
-  const bodyY = -26;
-  const legSwing = Math.sin(e.run * 1.6) * 8;
-  // 다리
-  ctx.strokeStyle = "#7d7266"; ctx.lineWidth = 6; ctx.lineCap = "round";
-  ctx.beginPath();
-  ctx.moveTo(-12, bodyY + 14); ctx.lineTo(-12 - legSwing, 0);
-  ctx.moveTo(12, bodyY + 14); ctx.lineTo(12 + legSwing, 0);
-  ctx.moveTo(-4, bodyY + 14); ctx.lineTo(-4 + legSwing, 0);
-  ctx.moveTo(18, bodyY + 14); ctx.lineTo(18 - legSwing, 0);
-  ctx.stroke();
-  // 몸통 (등이 높은 하이에나 실루엣)
-  ctx.fillStyle = "#8a7d6d";
-  ctx.beginPath();
-  ctx.moveTo(-24, bodyY + 12);
-  ctx.quadraticCurveTo(-26, bodyY - 10, -6, bodyY - 10);
-  ctx.quadraticCurveTo(10, bodyY - 14, 24, bodyY + 2);
-  ctx.quadraticCurveTo(20, bodyY + 12, -24, bodyY + 12);
-  ctx.fill();
-  // 얼룩 반점
-  ctx.fillStyle = "#5f5648";
-  for (const [dx, dy] of [[-14, bodyY - 2], [-4, bodyY + 2], [4, bodyY - 4], [10, bodyY + 4]]) {
-    ctx.beginPath(); ctx.arc(dx, dy, 2.5, 0, Math.PI * 2); ctx.fill();
-  }
-  // 목 갈기 (거친 털)
-  ctx.strokeStyle = "#5f5648"; ctx.lineWidth = 2;
-  for (let i = 0; i < 5; i++) {
-    ctx.beginPath(); ctx.moveTo(16 - i * 4, bodyY - 10); ctx.lineTo(18 - i * 4, bodyY - 18); ctx.stroke();
-  }
+// ---- 적 ----
+function drawEnemy(e) {
+  const x = e.wx - camX; if (x < -120 || x > W + 120) return;
+  if (e.kind === "hyena") drawHyena(x, e);
+  else if (e.kind === "lion") drawLion(x, e);
+  else if (e.kind === "cactus") drawCactus(x, e);
+  else if (e.kind === "croc") drawCroc(x, e);
+  else if (e.kind === "cheetah") drawCheetah(x, e);
+  else if (e.kind === "snake") drawSnake(x, e);
+  else if (e.kind === "scorpion") drawScorpion(x, e);
+}
+// ---- 치타 (야간 초원) ----
+function drawCheetah(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(60,30,8,.28)"; ctx.beginPath(); ctx.ellipse(0, 4, 34, 6, 0, 0, 7); ctx.fill();
+  const bodyY = -30, ls = Math.sin(e.run * 1.9) * 14; // 빠른 질주
+  ctx.strokeStyle = "#e0a94e"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-16, bodyY + 16); ctx.lineTo(-16 - ls, 0); ctx.moveTo(16, bodyY + 16); ctx.lineTo(16 + ls, 0); ctx.moveTo(-6, bodyY + 16); ctx.lineTo(-6 + ls, 0); ctx.moveTo(22, bodyY + 16); ctx.lineTo(22 - ls, 0); ctx.stroke();
+  // 긴 꼬리
+  ctx.strokeStyle = "#e0a94e"; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(-26, bodyY + 6); ctx.quadraticCurveTo(-56, bodyY + 2, -54, bodyY - 16); ctx.stroke();
+  ctx.fillStyle = "#2a2018"; ctx.beginPath(); ctx.arc(-54, bodyY - 18, 4, 0, 7); ctx.fill();
+  // 날렵한 몸통
+  ctx.fillStyle = "#e9b45a";
+  ctx.beginPath(); ctx.moveTo(-26, bodyY + 12); ctx.quadraticCurveTo(-30, bodyY - 4, -4, bodyY - 4); ctx.quadraticCurveTo(16, bodyY - 8, 26, bodyY + 4); ctx.quadraticCurveTo(22, bodyY + 12, -26, bodyY + 12); ctx.fill();
+  // 검은 점무늬
+  ctx.fillStyle = "#3a2a16"; for (const [dx, dy] of [[-16,bodyY+2],[-8,bodyY-1],[0,bodyY+3],[6,bodyY-2],[12,bodyY+4],[-12,bodyY+7]]) { ctx.beginPath(); ctx.arc(dx, dy, 2.2, 0, 7); ctx.fill(); }
   // 머리
-  ctx.fillStyle = "#9c8f7d";
-  ctx.beginPath(); ctx.ellipse(26, bodyY - 2, 12, 9, 0.2, 0, Math.PI * 2); ctx.fill();
-  // 귀
-  ctx.fillStyle = "#7d7266";
-  ctx.beginPath(); ctx.moveTo(22, bodyY - 10); ctx.lineTo(20, bodyY - 20); ctx.lineTo(28, bodyY - 12); ctx.fill();
-  // 주둥이
-  ctx.fillStyle = "#b3a794";
-  ctx.beginPath(); ctx.ellipse(36, bodyY + 2, 8, 5, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#3a3229";
-  ctx.beginPath(); ctx.arc(42, bodyY + 2, 2.5, 0, Math.PI * 2); ctx.fill();
-  // 눈 (사악하게)
-  ctx.fillStyle = "#d8b100";
-  ctx.beginPath(); ctx.arc(28, bodyY - 4, 2.6, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#000";
-  ctx.beginPath(); ctx.arc(28.6, bodyY - 4, 1.1, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#eec066"; ctx.beginPath(); ctx.arc(28, bodyY - 4, 11, 0, 7); ctx.fill();
+  ctx.fillStyle = "#d89a44"; ctx.beginPath(); ctx.arc(24, bodyY - 13, 4, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(33, bodyY - 13, 4, 0, 7); ctx.fill();
+  // 눈물자국(치타 특징)
+  ctx.strokeStyle = "#2a1c10"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(31, bodyY - 5); ctx.lineTo(35, bodyY + 3); ctx.stroke();
+  ctx.fillStyle = "#ffe08a"; ctx.beginPath(); ctx.arc(32, bodyY - 6, 2.4, 0, 7); ctx.fill();
+  ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(32.6, bodyY - 6, 1.1, 0, 7); ctx.fill();
+  ctx.fillStyle = "#5a3a20"; ctx.beginPath(); ctx.arc(38, bodyY - 2, 2, 0, 7); ctx.fill();
   ctx.restore();
 }
-
-// ---- 성체 검은 갈기 숫사자 (강한 적) ----
-function drawLion(e) {
-  const cx = e.x, feetY = e.y;
-  ctx.save();
-  ctx.translate(cx, feetY);
-  // 그림자
-  ctx.fillStyle = "rgba(80,40,10,0.3)";
-  ctx.beginPath(); ctx.ellipse(0, 4, 40, 8, 0, 0, Math.PI * 2); ctx.fill();
-
-  const bodyY = -38;
-  const legSwing = Math.sin(e.run * 1.5) * 11;
-  // 다리
-  ctx.strokeStyle = "#c98a3a"; ctx.lineWidth = 10; ctx.lineCap = "round";
+// ---- 뱀 (동굴) ----
+function drawSnake(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(0,0,0,.3)"; ctx.beginPath(); ctx.ellipse(-4, 2, 22, 5, 0, 0, 7); ctx.fill();
+  const wig = Math.sin(e.run) * 3;
+  // S자 몸통
+  ctx.strokeStyle = "#4a7d3a"; ctx.lineWidth = 11; ctx.lineCap = "round";
   ctx.beginPath();
-  ctx.moveTo(-18, bodyY + 22); ctx.lineTo(-18 - legSwing, 0);
-  ctx.moveTo(16, bodyY + 22); ctx.lineTo(16 + legSwing, 0);
-  ctx.moveTo(-6, bodyY + 22); ctx.lineTo(-6 + legSwing, 0);
-  ctx.moveTo(26, bodyY + 22); ctx.lineTo(26 - legSwing, 0);
+  ctx.moveTo(-22, -4);
+  ctx.quadraticCurveTo(-10, -14 + wig, 0, -6);
+  ctx.quadraticCurveTo(10, 2 + wig, 16, -14);
   ctx.stroke();
-  // 꼬리
-  ctx.strokeStyle = "#c98a3a"; ctx.lineWidth = 5;
-  ctx.beginPath(); ctx.moveTo(-32, bodyY + 8);
-  ctx.quadraticCurveTo(-52, bodyY, -46, bodyY - 18); ctx.stroke();
-  ctx.fillStyle = "#1c140c";
-  ctx.beginPath(); ctx.arc(-46, bodyY - 20, 6, 0, Math.PI * 2); ctx.fill();
-  // 몸통
-  const bg = ctx.createLinearGradient(0, bodyY, 0, bodyY + 32);
-  bg.addColorStop(0, "#d99640"); bg.addColorStop(1, "#b9772c");
-  ctx.fillStyle = bg;
-  roundRect(-34, bodyY, 58, 34, 15); ctx.fill();
-
-  // 검은 갈기 (성체 숫사자의 상징)
+  // 무늬
+  ctx.strokeStyle = "#2f5226"; ctx.lineWidth = 3;
+  for (let i = -18; i < 12; i += 8) { ctx.beginPath(); ctx.moveTo(i, -6); ctx.lineTo(i + 2, -12); ctx.stroke(); }
+  // 세워든 머리
+  ctx.fillStyle = "#4a7d3a"; ctx.beginPath(); ctx.ellipse(20, -22, 9, 7, -0.5, 0, 7); ctx.fill();
+  // 사악한 눈
+  ctx.fillStyle = "#e8c024"; ctx.beginPath(); ctx.arc(24, -25, 2.6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#000"; ctx.save(); ctx.translate(24, -25); ctx.scale(.5, 1); ctx.beginPath(); ctx.arc(0, 0, 1.8, 0, 7); ctx.fill(); ctx.restore();
+  // 갈라진 혀
+  ctx.strokeStyle = "#d23a3a"; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(28, -22); ctx.lineTo(38, -24); ctx.moveTo(38, -24); ctx.lineTo(42, -22); ctx.moveTo(38, -24); ctx.lineTo(42, -26); ctx.stroke();
+  ctx.restore();
+}
+// ---- 전갈 (사막) ----
+function drawScorpion(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(60,30,8,.28)"; ctx.beginPath(); ctx.ellipse(0, 2, 26, 5, 0, 0, 7); ctx.fill();
+  const bob = Math.sin(e.run) * 1.5;
+  ctx.strokeStyle = "#7a2e12"; ctx.lineWidth = 3; ctx.lineCap = "round";
+  // 다리
+  for (let i = 0; i < 4; i++) { const lx = -14 + i * 8; ctx.beginPath(); ctx.moveTo(lx, -8); ctx.lineTo(lx - 6, -1 + (i % 2) * 2); ctx.moveTo(lx, -8); ctx.lineTo(lx + 4, -1 + ((i + 1) % 2) * 2); ctx.stroke(); }
+  // 몸통 마디
+  ctx.fillStyle = "#8f3618"; for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.ellipse(-14 + i * 8, -11 + bob, 6, 5, 0, 0, 7); ctx.fill(); }
+  // 집게(앞)
+  ctx.strokeStyle = "#8f3618"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(16, -10); ctx.lineTo(28, -14); ctx.moveTo(16, -10); ctx.lineTo(26, -4); ctx.stroke();
+  ctx.fillStyle = "#a5431e"; ctx.beginPath(); ctx.ellipse(30, -15, 5, 3, .4, 0, 7); ctx.fill(); ctx.beginPath(); ctx.ellipse(28, -3, 5, 3, -.4, 0, 7); ctx.fill();
+  // 치켜든 독침 꼬리
+  ctx.strokeStyle = "#8f3618"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-18, -11); ctx.quadraticCurveTo(-34, -18, -30, -34); ctx.quadraticCurveTo(-28, -44, -18, -42); ctx.stroke();
+  ctx.fillStyle = "#c9532a"; ctx.beginPath(); ctx.moveTo(-18, -44); ctx.lineTo(-10, -46); ctx.lineTo(-16, -38); ctx.closePath(); ctx.fill(); // 침
+  // 눈
+  ctx.fillStyle = "#1a0e06"; ctx.beginPath(); ctx.arc(12, -13, 1.6, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function drawHyena(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(60,30,8,.25)"; ctx.beginPath(); ctx.ellipse(0, 4, 28, 6, 0, 0, 7); ctx.fill();
+  const bodyY = -26, ls = Math.sin(e.run * 1.6) * 8;
+  ctx.strokeStyle = "#7d7266"; ctx.lineWidth = 6; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-12, bodyY + 14); ctx.lineTo(-12 - ls, 0); ctx.moveTo(12, bodyY + 14); ctx.lineTo(12 + ls, 0); ctx.moveTo(-4, bodyY + 14); ctx.lineTo(-4 + ls, 0); ctx.moveTo(18, bodyY + 14); ctx.lineTo(18 - ls, 0); ctx.stroke();
+  ctx.fillStyle = "#8a7d6d"; ctx.beginPath(); ctx.moveTo(-24, bodyY + 12); ctx.quadraticCurveTo(-26, bodyY - 10, -6, bodyY - 10); ctx.quadraticCurveTo(10, bodyY - 14, 24, bodyY + 2); ctx.quadraticCurveTo(20, bodyY + 12, -24, bodyY + 12); ctx.fill();
+  ctx.fillStyle = "#5f5648"; for (const [dx, dy] of [[-14, bodyY - 2], [-4, bodyY + 2], [4, bodyY - 4], [10, bodyY + 4]]) { ctx.beginPath(); ctx.arc(dx, dy, 2.5, 0, 7); ctx.fill(); }
+  ctx.strokeStyle = "#5f5648"; ctx.lineWidth = 2; for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.moveTo(16 - i * 4, bodyY - 10); ctx.lineTo(18 - i * 4, bodyY - 18); ctx.stroke(); }
+  ctx.fillStyle = "#9c8f7d"; ctx.beginPath(); ctx.ellipse(26, bodyY - 2, 12, 9, .2, 0, 7); ctx.fill();
+  ctx.fillStyle = "#7d7266"; ctx.beginPath(); ctx.moveTo(22, bodyY - 10); ctx.lineTo(20, bodyY - 20); ctx.lineTo(28, bodyY - 12); ctx.fill();
+  ctx.fillStyle = "#b3a794"; ctx.beginPath(); ctx.ellipse(36, bodyY + 2, 8, 5, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#3a3229"; ctx.beginPath(); ctx.arc(42, bodyY + 2, 2.5, 0, 7); ctx.fill();
+  ctx.fillStyle = "#d8b100"; ctx.beginPath(); ctx.arc(28, bodyY - 4, 2.6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(28.6, bodyY - 4, 1.1, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function drawLion(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(60,30,8,.3)"; ctx.beginPath(); ctx.ellipse(0, 4, 40, 8, 0, 0, 7); ctx.fill();
+  const bodyY = -38, ls = Math.sin(e.run * 1.5) * 11;
+  ctx.strokeStyle = "#c98a3a"; ctx.lineWidth = 10; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-18, bodyY + 22); ctx.lineTo(-18 - ls, 0); ctx.moveTo(16, bodyY + 22); ctx.lineTo(16 + ls, 0); ctx.moveTo(-6, bodyY + 22); ctx.lineTo(-6 + ls, 0); ctx.moveTo(26, bodyY + 22); ctx.lineTo(26 - ls, 0); ctx.stroke();
+  ctx.strokeStyle = "#c98a3a"; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(-32, bodyY + 8); ctx.quadraticCurveTo(-52, bodyY, -46, bodyY - 18); ctx.stroke();
+  ctx.fillStyle = "#1c140c"; ctx.beginPath(); ctx.arc(-46, bodyY - 20, 6, 0, 7); ctx.fill();
+  const bg = ctx.createLinearGradient(0, bodyY, 0, bodyY + 32); bg.addColorStop(0, "#d99640"); bg.addColorStop(1, "#b9772c");
+  ctx.fillStyle = bg; rr(-34, bodyY, 58, 34, 15); ctx.fill();
   const hx = 26, hy = bodyY + 2;
-  ctx.fillStyle = "#1a1108";
-  // 갈기 삐죽삐죽
-  ctx.beginPath();
-  const spikes = 12, R1 = 30, R2 = 18;
-  for (let i = 0; i <= spikes; i++) {
-    const a = -Math.PI * 0.75 + (i / spikes) * Math.PI * 1.5;
-    const r = i % 2 ? R1 : R2;
-    const px = hx + Math.cos(a) * r, py = hy + Math.sin(a) * r;
-    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
-  }
+  ctx.fillStyle = "#1a1108"; ctx.beginPath();
+  for (let i = 0; i <= 12; i++) { const a = -Math.PI * .75 + (i / 12) * Math.PI * 1.5; const r = i % 2 ? 30 : 18; const px = hx + Math.cos(a) * r, py = hy + Math.sin(a) * r; i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); }
   ctx.closePath(); ctx.fill();
-  // 얼굴
-  ctx.fillStyle = "#e0a24a";
-  ctx.beginPath(); ctx.arc(hx + 4, hy, 16, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#e0a24a"; ctx.beginPath(); ctx.arc(hx + 4, hy, 16, 0, 7); ctx.fill();
+  ctx.fillStyle = "#f0d199"; ctx.beginPath(); ctx.ellipse(hx + 12, hy + 6, 10, 7, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#4a2a10"; ctx.beginPath(); ctx.moveTo(hx + 16, hy + 2); ctx.lineTo(hx + 22, hy + 2); ctx.lineTo(hx + 19, hy + 6); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#ffcf3a"; ctx.beginPath(); ctx.arc(hx + 4, hy - 3, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(hx + 5, hy - 3, 1.4, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#1a1108"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(hx - 2, hy - 8); ctx.lineTo(hx + 10, hy - 5); ctx.stroke();
+  ctx.restore();
+}
+function drawCactus(x, e) {
+  const feetY = e.baseY;
+  ctx.save(); ctx.translate(x, feetY);
+  ctx.fillStyle = "rgba(60,30,8,.25)"; ctx.beginPath(); ctx.ellipse(0, 2, 16, 5, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#3e7d3a";
+  rr(-9, -e.h, 18, e.h, 9); ctx.fill();
+  rr(-28, -e.h + 16, 13, 30, 6); ctx.fill(); ctx.fillRect(-28, -e.h + 16, 24, 13);
+  rr(15, -e.h + 6, 13, 34, 6); ctx.fill(); ctx.fillRect(3, -e.h + 6, 24, 13);
+  ctx.strokeStyle = "#2c5c2a"; ctx.lineWidth = 2; for (let y = -e.h + 8; y < -6; y += 12) { ctx.beginPath(); ctx.moveTo(-4, y); ctx.lineTo(-4, y + 6); ctx.moveTo(4, y); ctx.lineTo(4, y + 6); ctx.stroke(); }
+  ctx.restore();
+}
+function drawCroc(x, e) {
+  ctx.save(); ctx.translate(x, e.y);
+  // 물 위로 드러난 등/눈/주둥이
+  ctx.fillStyle = "#3f6b3a";
+  rr(-e.w / 2, -6, e.w, 12, 6); ctx.fill();
+  // 등 비늘
+  ctx.fillStyle = "#2f5230"; for (let i = -e.w / 2 + 8; i < e.w / 2 - 6; i += 12) { ctx.beginPath(); ctx.moveTo(i, -6); ctx.lineTo(i + 5, -13); ctx.lineTo(i + 10, -6); ctx.closePath(); ctx.fill(); }
   // 주둥이
-  ctx.fillStyle = "#f0d199";
-  ctx.beginPath(); ctx.ellipse(hx + 12, hy + 6, 10, 7, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#4a2a10";
-  ctx.beginPath(); ctx.moveTo(hx + 16, hy + 2); ctx.lineTo(hx + 22, hy + 2); ctx.lineTo(hx + 19, hy + 6); ctx.closePath(); ctx.fill();
-  // 사나운 눈
-  ctx.fillStyle = "#ffcf3a";
-  ctx.beginPath(); ctx.arc(hx + 4, hy - 3, 3, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#000";
-  ctx.beginPath(); ctx.arc(hx + 5, hy - 3, 1.4, 0, Math.PI * 2); ctx.fill();
-  // 눈썹 (화난 표정)
-  ctx.strokeStyle = "#1a1108"; ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.moveTo(hx - 2, hy - 8); ctx.lineTo(hx + 10, hy - 5); ctx.stroke();
+  ctx.fillStyle = "#3f6b3a"; rr(e.w / 2 - 6, -4, 22, 9, 4); ctx.fill();
+  ctx.strokeStyle = "#e8f0d8"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(e.w / 2 - 4, 1); ctx.lineTo(e.w / 2 + 14, 1); ctx.stroke();
+  // 눈
+  ctx.fillStyle = "#e8d24a"; ctx.beginPath(); ctx.arc(e.w / 2 - 8, -8, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(e.w / 2 - 8, -8, 1.3, 0, 7); ctx.fill();
   ctx.restore();
 }
 
-// ---- HUD ----
+// ---- HUD / 오버레이 ----
 function drawHUD() {
-  ctx.fillStyle = "#4a2810";
-  ctx.font = "bold 26px -apple-system, sans-serif";
+  const tot = score + coinScore;
   ctx.textAlign = "left";
-  ctx.fillText("점수 " + score, 24, 42);
-  ctx.font = "bold 16px -apple-system, sans-serif";
-  ctx.fillStyle = "rgba(74,40,16,0.75)";
-  ctx.fillText("최고 " + best, 24, 66);
+  ctx.fillStyle = "rgba(0,0,0,.35)"; rr(14, 14, 182, 58, 12); ctx.fill();
+  ctx.fillStyle = "#fff4dc"; ctx.font = "bold 24px -apple-system, sans-serif"; ctx.fillText("점수 " + tot, 26, 42);
+  ctx.font = "bold 14px -apple-system, sans-serif"; ctx.fillStyle = "rgba(255,244,220,.8)"; ctx.fillText("최고 " + best, 26, 62);
+  // 스테이지 표시
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(0,0,0,.35)"; rr(W - 210, 14, 196, 40, 12); ctx.fill();
+  ctx.fillStyle = "#ffe6b0"; ctx.font = "bold 16px -apple-system, sans-serif";
+  ctx.fillText(`STAGE ${loop * 5 + stageIdx + 1} · ${curStage().name}`, W - 26, 40);
+  ctx.textAlign = "left";
 }
-
+function drawBanner() {
+  const a = Math.min(1, bannerT / 30) * (bannerT > 120 ? (150 - bannerT) / 30 : 1);
+  ctx.globalAlpha = Math.max(0, Math.min(1, a));
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(0,0,0,.45)"; rr(W / 2 - 200, H / 2 - 54, 400, 92, 16); ctx.fill();
+  ctx.fillStyle = "#fff4dc"; ctx.font = "bold 40px -apple-system, sans-serif";
+  ctx.fillText(`STAGE ${loop * 5 + stageIdx + 1}`, W / 2, H / 2 - 10);
+  ctx.fillStyle = "#ffd9a0"; ctx.font = "bold 22px -apple-system, sans-serif";
+  ctx.fillText(`${curStage().name}  ·  ${curStage().sub}`, W / 2, H / 2 + 22);
+  ctx.globalAlpha = 1; ctx.textAlign = "left";
+}
 function drawReady() {
-  dim(0.35);
-  ctx.textAlign = "center";
-  ctx.fillStyle = "#fff4dc";
-  ctx.font = "bold 46px -apple-system, sans-serif";
-  ctx.fillText("심바 런", W / 2, H / 2 - 30);
-  ctx.font = "bold 20px -apple-system, sans-serif";
-  ctx.fillStyle = "#ffe6b0";
-  ctx.fillText("SIMBA RUN — 프라이드랜드를 달려라!", W / 2, H / 2 + 2);
-  ctx.font = "18px -apple-system, sans-serif";
-  const pulse = 0.6 + Math.sin(t * 0.1) * 0.4;
-  ctx.globalAlpha = pulse;
-  ctx.fillText("👆 화면을 탭하면 점프 (2단 점프 가능)", W / 2, H / 2 + 40);
-  ctx.globalAlpha = 1;
-  ctx.font = "16px -apple-system, sans-serif";
-  ctx.fillStyle = "#ffd9a0";
-  ctx.fillText("하이에나와 검은 갈기 사자를 피하고 열매를 먹어라", W / 2, H / 2 + 70);
+  dim(.32); ctx.textAlign = "center";
+  ctx.fillStyle = "#fff4dc"; ctx.font = "bold 48px -apple-system, sans-serif"; ctx.fillText("심바 런", W / 2, H / 2 - 46);
+  ctx.fillStyle = "#ffe6b0"; ctx.font = "bold 20px -apple-system, sans-serif"; ctx.fillText("SIMBA RUN — 5개의 대지를 달려라", W / 2, H / 2 - 16);
+  ctx.globalAlpha = .6 + Math.sin(t * .1) * .4; ctx.font = "18px -apple-system, sans-serif"; ctx.fillStyle = "#fff";
+  ctx.fillText("👆 탭 = 점프(2단) · 물에선 탭 = 헤엄", W / 2, H / 2 + 20); ctx.globalAlpha = 1;
+  ctx.fillStyle = "#ffd9a0"; ctx.font = "15px -apple-system, sans-serif";
+  ctx.fillText("낭떠러지는 뛰어넘고, 지형마다 다른 적을 피하라 (치타·뱀·악어·전갈)", W / 2, H / 2 + 48);
+  ctx.textAlign = "left";
 }
-
 function drawDead() {
-  dim(0.5);
-  ctx.textAlign = "center";
-  ctx.fillStyle = "#ffd9c0";
-  ctx.font = "bold 44px -apple-system, sans-serif";
-  ctx.fillText("GAME OVER", W / 2, H / 2 - 20);
-  ctx.fillStyle = "#fff4dc";
-  ctx.font = "bold 24px -apple-system, sans-serif";
-  ctx.fillText("점수 " + score + "   ·   최고 " + best, W / 2, H / 2 + 16);
-  if (t - deadAt > 30) {
-    const pulse = 0.55 + Math.sin(t * 0.12) * 0.45;
-    ctx.globalAlpha = pulse;
-    ctx.font = "18px -apple-system, sans-serif";
-    ctx.fillText("👆 탭하면 다시 시작", W / 2, H / 2 + 54);
-    ctx.globalAlpha = 1;
-  }
+  dim(.5); ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd9c0"; ctx.font = "bold 46px -apple-system, sans-serif"; ctx.fillText("GAME OVER", W / 2, H / 2 - 24);
+  ctx.fillStyle = "#fff4dc"; ctx.font = "bold 22px -apple-system, sans-serif";
+  ctx.fillText(`점수 ${score + coinScore}  ·  최고 ${best}`, W / 2, H / 2 + 12);
+  ctx.fillStyle = "#ffd9a0"; ctx.font = "16px -apple-system, sans-serif";
+  ctx.fillText(`도달: STAGE ${loop * 5 + stageIdx + 1} · ${curStage().name}`, W / 2, H / 2 + 40);
+  if (t - deadAt > 30) { ctx.globalAlpha = .55 + Math.sin(t * .12) * .45; ctx.font = "18px -apple-system, sans-serif"; ctx.fillStyle = "#fff"; ctx.fillText("👆 탭하면 처음부터 다시", W / 2, H / 2 + 72); ctx.globalAlpha = 1; }
+  ctx.textAlign = "left";
 }
-
-function dim(a) { ctx.fillStyle = "rgba(30,15,5," + a + ")"; ctx.fillRect(0, 0, W, H); }
+function dim(a) { ctx.fillStyle = "rgba(20,10,4," + a + ")"; ctx.fillRect(0, 0, W, H); }
 
 // ---- 유틸 ----
-function roundRect(x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function shade(hex, d) {
+  const n = parseInt(hex.slice(1), 16); let r = (n >> 16) + d, g = ((n >> 8) & 255) + d, b = (n & 255) + d;
+  r = Math.max(0, Math.min(255, r)); g = Math.max(0, Math.min(255, g)); b = Math.max(0, Math.min(255, b));
+  return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+
+// ---- 디버그 훅 (#debug 일 때만) ----
+if (location.hash === "#debug") {
+  window.__dbg = {
+    goBiome(b) { const i = STAGES.findIndex(s => s.biome === b); if (i >= 0) { stageIdx = i; state = State.PLAY; safeX = camX; } },
+    spawn(kind, opts = {}) {
+      const gy = groundAt(playerWX() + 260).y;
+      const s = kind === "lion" ? [78,58] : kind === "cactus" ? [34,56] : kind === "cheetah" ? [68,44] : kind === "snake" ? [48,40] : kind === "scorpion" ? [52,30] : kind === "croc" ? [74,26] : [58,38];
+      enemies.push({ kind, wx: playerWX() + (opts.dx || 260), baseY: gy, y: gy, w: s[0], h: s[1], run: 0, vx: 0 });
+    },
+    state() { return { stageIdx, biome: curStage().biome, camX, enemies: enemies.length, segs: segs.length, paused, timeScale, scale, offX, offY }; },
+    consts() { return { AIRTIME, GAP_MIN, GAP_MAX, LAND_MIN, BASE_SPEED, PX, SIMBA_H }; },
+    // 생성기를 강제로 많이 돌려 지형/적을 뽑아 클리어 가능성 불변식 검사용 데이터 반환
+    scan(biome, count) {
+      const i = STAGES.findIndex(s => s.biome === biome); if (i >= 0) stageIdx = i;
+      safeX = camX; // 즉시 위험 생성 허용
+      const startSeg = segs.length, startEne = enemies.length;
+      const targetX = genX + count;
+      while (genX < targetX) addSegment();
+      return { segs: segs.slice(startSeg).map(s => ({ ...s })), enemies: enemies.slice(startEne).map(e => ({ kind: e.kind, wx: e.wx, w: e.w, h: e.h })) };
+    }
+  };
 }
 
 // ---- 루프 ----
-function loop() {
-  update();
+generate();
+function frame() {
+  if (!paused) { const n = state === State.PLAY ? timeScale : 1; for (let i = 0; i < n; i++) update(); }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   draw();
-  requestAnimationFrame(loop);
+  requestAnimationFrame(frame);
 }
-loop();
+frame();
 
 })();
 </script>
